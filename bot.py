@@ -11,6 +11,7 @@ from content import (
     QUESTIONS,
     RESTART_BUTTON,
     RESULTS,
+    SCORING_INDICES,
     TEXT_FALLBACK,
     WELCOME_BUTTON,
     WELCOME_TEXT,
@@ -29,6 +30,7 @@ router = Router()
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _find_selected_label(question_index: int, history: str, chosen: str) -> str:
+    """Finds the button label the user clicked."""
     available = get_available_buttons(question_index, history)
     for label, number in available:
         if number == chosen:
@@ -37,6 +39,7 @@ def _find_selected_label(question_index: int, history: str, chosen: str) -> str:
 
 
 async def _freeze_message(callback: CallbackQuery, question_index: int, history: str, chosen: str) -> None:
+    """Freezes the old message: shows question + selected answer, removes buttons."""
     question_text = QUESTIONS[question_index]["text"]
     selected_label = _find_selected_label(question_index, history, chosen)
     frozen_text = f"{question_text}\n\n✅ <b>{selected_label}</b>"
@@ -44,13 +47,26 @@ async def _freeze_message(callback: CallbackQuery, question_index: int, history:
 
 
 def _question_keyboard(question_index: int, history: str) -> InlineKeyboardMarkup:
+    """Builds inline keyboard for a question.
+
+    For scoring questions: callback = ans_{history}_{number} or res_{history}_{number}.
+    For filler questions: callback = filler_{qidx}_{history}_{number}.
+    """
     available = get_available_buttons(question_index, history)
+    is_scoring = QUESTIONS[question_index]["scores"]
+    is_last = question_index == len(QUESTIONS) - 1
+    is_last_scoring = is_scoring and question_index == SCORING_INDICES[-1]
     buttons = []
     for label, number in available:
-        if question_index < len(QUESTIONS) - 1:
-            cb = f"ans_{history}_{number}" if history else f"ans_{number}"
-        else:
+        if not is_scoring:
+            # Filler: carry history and question index through
+            cb = f"filler_{question_index}_{history}_{number}" if history else f"filler_{question_index}__{number}"
+        elif is_last_scoring or is_last:
+            # Last scoring question → result
             cb = f"res_{history}_{number}" if history else f"res_{number}"
+        else:
+            # Intermediate scoring question
+            cb = f"ans_{history}_{number}" if history else f"ans_{number}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=cb)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -93,29 +109,60 @@ async def on_start_quiz(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("ans_"))
 async def on_answer(callback: CallbackQuery) -> None:
+    """Scoring answer → freeze old, advance to next question."""
+    # ans_1 or ans_1_2 → history = "1" / "1_2"
     history = callback.data[len("ans_"):]
-    question_index = history.count("_") + 1
-    prev_question_index = question_index - 1
-    prev_history = "_".join(history.split("_")[:-1])
-    chosen = history.split("_")[-1]
+    answers = history.split("_")
+    scoring_count = len(answers)  # how many scoring answers so far
+    chosen = answers[-1]
+    prev_history = "_".join(answers[:-1])
 
-    await _freeze_message(callback, prev_question_index, prev_history, chosen)
+    # The scoring question that was just answered
+    prev_scoring_qi = SCORING_INDICES[scoring_count - 1]
+
+    await _freeze_message(callback, prev_scoring_qi, prev_history, chosen)
+
+    # Next question in the overall list
+    next_qi = prev_scoring_qi + 1
     await callback.message.answer(
-        QUESTIONS[question_index]["text"],
-        reply_markup=_question_keyboard(question_index=question_index, history=history),
+        QUESTIONS[next_qi]["text"],
+        reply_markup=_question_keyboard(question_index=next_qi, history=history),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("filler_"))
+async def on_filler(callback: CallbackQuery) -> None:
+    """Filler answer → freeze old, advance to next question. History unchanged."""
+    # filler_{qidx}_{history}_{chosen} or filler_{qidx}__{chosen} (empty history)
+    payload = callback.data[len("filler_"):]
+    parts = payload.split("_")
+    filler_qi = int(parts[0])
+    chosen = parts[-1]
+    # history is between qidx and chosen; may be empty
+    history = "_".join(parts[1:-1]).strip("_")
+
+    await _freeze_message(callback, filler_qi, history, chosen)
+
+    # Next question in the overall list
+    next_qi = filler_qi + 1
+    await callback.message.answer(
+        QUESTIONS[next_qi]["text"],
+        reply_markup=_question_keyboard(question_index=next_qi, history=history),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("res_"))
 async def on_result(callback: CallbackQuery) -> None:
+    """Final scoring answer → freeze old, show result."""
     key = callback.data[len("res_"):]
     result_text = RESULTS.get(key, "Что-то пошло не так 🤔 Попробуй ещё раз!")
     parts = key.split("_")
     prev_history = "_".join(parts[:-1])
     chosen = parts[-1]
 
-    await _freeze_message(callback, 2, prev_history, chosen)
+    await _freeze_message(callback, SCORING_INDICES[-1], prev_history, chosen)
     await callback.message.answer(
         result_text,
         reply_markup=_restart_keyboard(),
